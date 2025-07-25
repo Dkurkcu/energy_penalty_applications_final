@@ -1,0 +1,14 @@
+method: grid  # Grid search for hyperparameter tuning
+name: ppo_sweep_0.05
+metric:
+  name: success_rate
+  goal: maximize
+parameters:
+  learning_rate:
+    values: [1e-4,5e-5]
+  ent_coef:
+    values: [0.01,0.03]
+  batch_size:
+    values: [64,128]
+
+  #include different variables...

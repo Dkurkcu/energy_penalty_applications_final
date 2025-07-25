@@ -19,6 +19,13 @@ class ReacherV3Env(MujocoEnv, EzPickle):
         self.current_delay = 0
         self.delay_pending_termination = False
 
+    def seed(self, seed_value=None):
+        """Set the random seed for numpy and the environment"""
+        self.np_random, seed_value = np.random.RandomState(seed_value), seed_value
+        # You can also set the random seed for the simulation if needed:
+        self.model.opt.timestep = seed_value  # for MuJoCo, or any other random aspects
+        return [seed_value]
+
     def get_obs(self):
         qpos = self.data.qpos[:2]
         qvel = self.data.qvel[:2]
@@ -30,33 +37,36 @@ class ReacherV3Env(MujocoEnv, EzPickle):
         return self.get_obs()
 
     def reset_model(self):
-        # Randomize starting position for the arm each time (small range)
         qpos = np.random.uniform(low=-1.0, high=1.0, size=2)
         qvel = np.zeros(self.model.nv)
         self.set_state(qpos, qvel)
-        # --- FIXED TARGET POSITION: Always at (0.7, 0, 0.1) (well within reach) ---
-        target_pos = np.array([0.7, 0.0, 0.1])
-        target_site_id = self.model.site("target").id
-        self.model.site_pos[target_site_id][:] = target_pos
-        # Uniformly sample a target inside a circle of reach radius R=0.7
-#R = 0.7
- #       theta = np.random.uniform(0, 2 * np.pi)
-  #      r = R * np.sqrt(np.random.uniform(0, 1))
-   #     x = r * np.cos(theta)
-    #    y = r * np.sin(theta)
-     #   target_pos = np.array([x, y, 0.1])
-      #  target_site_id = self.model.site("target").id
-       # self.model.site_pos[target_site_id][:] = target_pos
 
-        # For reward shaping, use fingertip site
+        # ---- Donut (Annulus) Spawn for Target ----
+        inner_radius = 0.02  # this is fixed
+        outer_radius = 0.06  # only change , increase this
+
+        # Uniform area distribution
+        r2 = np.random.uniform(inner_radius ** 2, outer_radius ** 2)
+        r = np.sqrt(r2)
+        theta = np.random.uniform(0, 2 * np.pi)
+        offset = r * np.array([np.cos(theta), np.sin(theta)])
+        target_xy = np.array([0.0, 0.0]) + offset
+        target_pos = np.array([target_xy[0], target_xy[1], 0.1])
+
+        self.model.site_pos[self.model.site("target").id][:] = target_pos
+        # ------------------------------------------
+
+        self.do_simulation(np.zeros(self.model.nu), 1)
+
         fingertip_pos = self.data.site_xpos[self.model.site("fingertip_site").id]
         self.prev_dist = np.linalg.norm(fingertip_pos - target_pos)
 
-        # Reset delay
         self.current_delay = 0
         self.delay_pending_termination = False
 
         return self.get_obs()
+
+
 
     def step(self, action):
         # Success delay logic
@@ -85,6 +95,7 @@ class ReacherV3Env(MujocoEnv, EzPickle):
         velocity_penalty = 0.005 * np.linalg.norm(qvel)
         action_penalty = 0.002 * np.linalg.norm(action)
         time_penalty = 0.01  # No time penalty
+        
 
         reward = distance_reward - velocity_penalty - action_penalty - time_penalty
 

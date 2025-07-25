@@ -11,7 +11,8 @@ def make_env():
     return env
 
 venv = DummyVecEnv([make_env])
-model = PPO.load("ppo_reacher_v3", env=venv)
+model = PPO.load("donut_0.02-0.05.zip", env=venv)
+
 obs = venv.reset()
 
 for episode in range(100):  # Number of episodes to watch
