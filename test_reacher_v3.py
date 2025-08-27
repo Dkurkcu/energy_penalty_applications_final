@@ -5,14 +5,27 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from gymnasium.wrappers import TimeLimit
 
+# Match the training energy settings here
+USE_ENERGY_PENALTY = True
+ENERGY_COEF = 0.1
+
 def make_env():
-    env = ReacherV3Env("reacher_v3.xml", render_mode="human")
-    env = TimeLimit(env, max_episode_steps=200)  # Longer episode for easier learning/viewing
+    env = ReacherV3Env(
+        "reacher_v3.xml",
+        render_mode="human",
+        use_energy_penalty=USE_ENERGY_PENALTY,
+        energy_penalty_coef=ENERGY_COEF
+    )
+    env = TimeLimit(env, max_episode_steps=200)  # keep your viewing length
     return env
 
 venv = DummyVecEnv([make_env])
-model = PPO.load("donut_0.02-0.05.zip", env=venv)
 
+# Optional sanity check: verify what the env actually uses
+print("Energy penalty ON?:", venv.get_attr("use_energy_penalty")[0],
+      "| coef:", venv.get_attr("energy_penalty_coef")[0])
+
+model = PPO.load("fixed_arm_directsweep.zip", env=venv)
 obs = venv.reset()
 
 for episode in range(100):  # Number of episodes to watch

@@ -1,105 +1,150 @@
-from stable_baselines3 import PPO
-import wandb
-from stable_baselines3.common.callbacks import BaseCallback
+import os
 import numpy as np
+import wandb
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv
 from gymnasium.wrappers import TimeLimit
 from reacher_v3 import ReacherV3Env
-import os
 
 log_dir = "./logs"
 os.makedirs(log_dir, exist_ok=True)
 
-# Create environment function
+# --- Energy penalty control
+USE_ENERGY_PENALTY = True
+ENERGY_COEF = 0.1  # Adjust this to penalize high energy usage
+
 def make_env():
-    env = ReacherV3Env("reacher_v3.xml")
-    env = TimeLimit(env, max_episode_steps=200)  # Ensure episode ends
-    env = Monitor(env, filename=os.path.join(log_dir, "monitor.csv"))  #  wrap after TimeLimit
+    # Pass energy config into the env PPO trains on
+    env = ReacherV3Env(
+        "reacher_v3.xml",
+        use_energy_penalty=USE_ENERGY_PENALTY,
+        energy_penalty_coef=ENERGY_COEF
+    )
+    env.energy_coef = ENERGY_COEF  # keep your original line; mapped to energy_penalty_coef
+    env = TimeLimit(env, max_episode_steps=300)
+    env = Monitor(env, filename=os.path.join(log_dir, "monitor.csv"),
+                  info_keywords=("episode_energy", "success"))
     return env
 
-# Create the vectorized environment
 venv = DummyVecEnv([make_env])
-
-# Check if environment is valid
 check_env(venv.envs[0], warn=True)
 
-# Initialize Weights & Biases
 wandb.init(
-    project="Reacher-Donut-Shaped",
-    name="0.02_---.100k_3e-4,0.01",
+    project="Reacher-Energy_plotting",
+    name="seed_0_energyeff_penaltytrue",
     config={
         "env_name": "ReacherV3",
-        "total_timesteps": 100_000,
-        "learning_rate": 3e-4,
-        "ent_coef": 0.01,
+        "total_timesteps": 1_000_000,
+        "learning_rate": 2e-5,
+        "ent_coef": 0.002,
+        "batch_size": 256,
+        "n_epochs": 15,
+        "clip_range": 0.02,
+        "gamma": 0.95,
+        "gae_lambda": 0.85,
+        "energy_coef": ENERGY_COEF,
     },
 )
 
-# Define custom callback to log rewards and success
+config = wandb.config
+
+# ✅ Logging callback (OLD metric: reward-threshold success)
 class ReacherLoggingCallback(BaseCallback):
     def __init__(self, verbose=0):
         super().__init__(verbose)
-        self.episode_rewards = []  # Track rewards per episode
-        self.success_flags = []    # Track success (1 if reward > 7.5 else 0)
-        self.window = 100          # Window size for moving average
+        self.episode_rewards = []
+        self.success_flags = []
+        self.window = 100
+        self.reward_success_threshold = 7.5  # unchanged
 
     def _on_step(self) -> bool:
         infos = self.locals.get("infos", [])
         for info in infos:
             if "episode" in info and "r" in info["episode"]:
                 reward = info["episode"]["r"]
-                self.episode_rewards.append(reward)
-                self.success_flags.append(1 if reward >= 7.5 else 0)
 
-                # Log episode reward
-                wandb.log({
+                self.episode_rewards.append(reward)
+                self.success_flags.append(1 if reward >= self.reward_success_threshold else 0)
+
+                log_dict = {
                     "episode_reward": reward,
                     "success_rate": np.mean(self.success_flags[-self.window:]),
-                }, step=self.num_timesteps)
+                }
+                if "episode_energy" in info:
+                    try:
+                        log_dict["episode_energy"] = float(info["episode_energy"])
+                    except Exception:
+                        pass
 
+                wandb.log(log_dict, step=self.num_timesteps)
         return True
 
     def _on_training_end(self) -> None:
         if len(self.episode_rewards) == 0:
             return
-
-        rewards = self.episode_rewards
-        episodes = list(range(len(rewards)))  # Create list of episodes
-
-        # Log Episode Reward Over Time (raw values)
         wandb.log({
-            "episode_reward_over_time": rewards,
+            "episode_reward_over_time": self.episode_rewards,
+            "moving_success_rate_plot": np.convolve(
+                self.success_flags, np.ones(self.window) / self.window, mode='valid'
+            ),
         })
 
-        # Log Moving Success Rate (raw values)
-        moving_success_rate = np.convolve(self.success_flags, np.ones(self.window) / self.window, mode='valid')
-        wandb.log({
-            "moving_success_rate_plot": moving_success_rate,
-        })
-# Set the random seed for reproducibility
-seed_value = 42
+# ✅ Energy annealing callback (kept)
+class EnergyAnneal(BaseCallback):
+    def __init__(self, start=0.02, end=1.0, ramp_steps=120_000, verbose=0):
+        super().__init__(verbose)
+        self.start, self.end, self.ramp_steps = start, end, ramp_steps
 
-# Set random seed for NumPy
+    def _on_training_start(self) -> None:
+        self.training_env.env_method("set_energy_coef", float(self.start))
+        wandb.log({"energy_coef": float(self.start)}, step=self.num_timesteps)
+
+    def _on_step(self) -> bool:
+        frac = min(1.0, self.num_timesteps / float(self.ramp_steps))
+        coef = float(self.start + frac * (self.end - self.start))
+        self.training_env.env_method("set_energy_coef", coef)
+        wandb.log({"energy_coef": coef}, step=self.num_timesteps)
+        return True
+
+# Set reproducibility 
+seed_value = 0
 np.random.seed(seed_value)
 
-# Set random seed for the gym environment
-env = ReacherV3Env("reacher_v3.xml")
-env.seed(seed_value)
-# Initialize PPO model
-model = PPO("MlpPolicy", venv, seed=seed_value, verbose=1, learning_rate=3e-4, ent_coef=0.01 )
+# Create environment for training (single env for checks/logging)
+env = ReacherV3Env(
+    "reacher_v3.xml",
+    use_energy_penalty=USE_ENERGY_PENALTY,
+    energy_penalty_coef=ENERGY_COEF
+)
+env.energy_coef = ENERGY_COEF  # keep your original line; mapped to energy_penalty_coef
+env = Monitor(env, info_keywords=("episode_energy", "success"))
 
-model = PPO.load("donut_outer_0.05.zip", env=venv)
-# Train the model
-model.learn(
-    total_timesteps=100_000,
-    callback=[ReacherLoggingCallback()]  # Only use our custom logging callback
+policy_kwargs = dict(net_arch=[256, 256, 256])
+
+# Load previous model and continue training with new energy penalty
+model = PPO.load(
+    "bothrandom9try.zip",
+    env=venv,  # make sure new env with energy penalty is used
+    learning_rate=config.learning_rate,
+    ent_coef=config.ent_coef,
+    batch_size=config.batch_size,
+    clip_range=config.clip_range,
+    n_epochs=config.n_epochs,
+    gae_lambda=config.gae_lambda,
+    seed=seed_value,
+    verbose=1,
 )
 
-# Save model and finish logging
-#model.save("donut_0.02-0.06.zip")
-wandb.finish()
+# Train with annealing + old logger
+model.learn(
+    total_timesteps=config.total_timesteps,
+    callback=[ReacherLoggingCallback(), EnergyAnneal(start=0.02, end=ENERGY_COEF, ramp_steps=120_000)]
+)
 
-# Close the environment
+# Save new model
+model.save("bothrandom10_energy.zip")
+wandb.finish()
 venv.close()

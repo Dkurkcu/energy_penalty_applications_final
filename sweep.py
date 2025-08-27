@@ -1,95 +1,170 @@
-import wandb
+import os
 import yaml
+import numpy as np
+import wandb
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.monitor import Monitor
-from reacher_v3 import ReacherV3Env
-from stable_baselines3.common.callbacks import BaseCallback
-import numpy as np
+from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
+from gymnasium.wrappers import TimeLimit
 
-# Load the sweep configuration from YAML
-with open("sweep_config.yaml", 'r') as file:
-    sweep_configuration = yaml.safe_load(file)
+USE_ENERGY_PENALTY = True
+ENERGY_COEF = 0.1
 
-# Initialize the sweep
-sweep_id = wandb.sweep(sweep_configuration, project="Reacher-Curriculum")
+def train():
+    wandb.init()
+    config = wandb.config
 
-class ReacherLoggingCallback(BaseCallback):
-    def __init__(self, verbose=0):
-        super().__init__(verbose)
-        self.episode_rewards = []  # Track rewards per episode
-        self.success_flags = []    # Track success (1 if success condition is met, else 0)
-        self.window = 100          # Window size for moving average
+    from reacher_v3 import ReacherV3Env  # Import here for total isolation
 
-    def _on_step(self) -> bool:
-        # Access `info` passed into the callback
-        infos = self.locals['infos']  # This contains the 'info' of all environments
+    # Unique log dir for each run
+    log_dir = f"./sweep_logs/{wandb.run.id}"
+    os.makedirs(log_dir, exist_ok=True)
 
-        for info in infos:
-            # Check if 'episode' exists in the info
-            if 'episode' in info:
-                # Extract reward and success status
-                reward = info['episode']['r']  # This is the reward for the current episode
-                # Safely access the success key
-                success = info['episode'].get('success', False)  # Default to False if 'success' is missing
+    def make_env(seed=None):
+        def _init():
+            env = ReacherV3Env(
+                "reacher_v3.xml",
+                use_energy_penalty=USE_ENERGY_PENALTY,
+                energy_penalty_coef=ENERGY_COEF
+            )
+            env.energy_coef = ENERGY_COEF
 
-                # Track the success rate based on some condition (e.g., distance threshold)
-                self.success_flags.append(1 if success else 0)
+            if seed is not None:
+                try:
+                    env.seed(int(seed))
+                except Exception:
+                    pass
 
-                # Log episode reward and success rate
-                wandb.log({
-                    "episode_reward": reward,
-                    "success_rate": np.mean(self.success_flags[-self.window:]),  # Moving average of success rate
-                }, step=self.num_timesteps)
+            env = TimeLimit(env, max_episode_steps=400)
+            env = Monitor(
+                env,
+                filename=os.path.join(log_dir, "monitor.csv"),
+                info_keywords=("episode_energy", "success")
+            )
+            return env
+        return _init
 
-        return True
+    class ReacherLoggingCallback(BaseCallback):
+        def __init__(self, window=100, spike_threshold=9.5, verbose=0):
+            super().__init__(verbose)
+            self.window = int(window)
+            self.spike_threshold = float(spike_threshold)
+            self.episode_rewards = []
+            self.success_flags = []  # your old reward-threshold SR (kept)
+            self.spike_flags = []    # 1 if reward >= spike_threshold
 
-    def _on_training_end(self) -> None:
-        if len(self.episode_rewards) == 0:
-            return
+            self.reward_success_threshold = 7.5  # unchanged
 
-        rewards = self.episode_rewards
-        episodes = list(range(len(rewards)))  # Create list of episodes
+        def _on_step(self) -> bool:
+            infos = self.locals.get("infos", [])
+            for info in infos:
+                if "episode" in info and "r" in info["episode"]:
+                    r = float(info["episode"]["r"])
+                    self.episode_rewards.append(r)
+                    self.success_flags.append(1 if r >= self.reward_success_threshold else 0)
+                    self.spike_flags.append(1 if r >= self.spike_threshold else 0)
 
-        # Log Episode Reward Over Time (raw values)
-        wandb.log({
-            "episode_reward_over_time": rewards,
-        })
+                    # Compute rolling stats
+                    w = self.window
+                    # classic success_rate (kept for dashboards)
+                    sr = float(np.mean(self.success_flags[-w:])) if len(self.success_flags) >= 1 else 0.0
 
-        # Log Moving Success Rate (raw values)
-        moving_success_rate = np.convolve(self.success_flags, np.ones(self.window) / self.window, mode='valid')
-        wandb.log({
-            "moving_success_rate_plot": moving_success_rate,
-        })
+                    # Improvement score: change in spike rate from first window to last window
+                    if len(self.spike_flags) >= 2 * w:
+                        first_rate = float(np.mean(self.spike_flags[:w]))
+                        last_rate = float(np.mean(self.spike_flags[-w:]))
+                        improvement_score = last_rate - first_rate
+                    else:
+                        first_rate = float("nan")
+                        last_rate = float(np.mean(self.spike_flags[-w:])) if len(self.spike_flags) >= 1 else float("nan")
+                        improvement_score = float("nan")  # not enough history yet
 
-# Function for training during the sweep (without saving the model)
-def train_sweep_model():
-    # Initialize WandB at the start of the function
-    wandb.init()  # Ensure WandB is initialized before using wandb.config
+                    log_dict = {
+                        "episode_reward": r,
+                        "success_rate": sr,                 # old metric, still visible
+                        "spike_rate_last_window": last_rate,
+                        "spike_rate_first_window": first_rate,
+                        "improvement_score": improvement_score,  # <-- SWEEP TARGET
+                    }
 
-    # Load the pre-trained model (ppo_reacher_0.03.zip)
-    model = PPO.load("donut_outer_0.05.zip", env=create_venv())  # Model trained at r=0.03
+                    # Log episode energy if present
+                    if "episode_energy" in info:
+                        try:
+                            log_dict["episode_energy"] = float(info["episode_energy"])
+                        except Exception:
+                            pass
 
-    # Apply the hyperparameters from the sweep for this trial
-    model.learning_rate = wandb.config.learning_rate
-    model.ent_coef = wandb.config.ent_coef
-    model.batch_size = wandb.config.batch_size  # If batch_size is also part of the sweep
+                    wandb.log(log_dict, step=self.num_timesteps)
+            return True
 
-    # Train the model with the new hyperparameters from the sweep
-    model.learn(total_timesteps=100_000, callback=[ReacherLoggingCallback()])  # Use custom callback to log performance
+    # Seed handling from sweep config
+    seed_value = int(config.seed)
+    np.random.seed(seed_value)
 
-    # Finish WandB logging without saving the model
+    venv = DummyVecEnv([make_env(seed=seed_value)])
+    try:
+        venv.seed(seed_value)
+    except Exception:
+        pass
+
+    learning_rate = float(config.learning_rate)
+    ent_coef = float(config.ent_coef)
+    batch_size = int(config.batch_size)
+    clip_range = float(config.clip_range)
+
+    env = ReacherV3Env(
+        "reacher_v3.xml",
+        use_energy_penalty=USE_ENERGY_PENALTY,
+        energy_penalty_coef=ENERGY_COEF
+    )
+    env.energy_coef = ENERGY_COEF
+    try:
+        env.seed(seed_value)
+    except Exception:
+        pass
+
+    policy_kwargs = dict(net_arch=[256, 256, 256])
+
+    model = PPO(
+        "MlpPolicy",
+        env=venv,
+        policy_kwargs=policy_kwargs,
+        learning_rate=learning_rate,
+        ent_coef=ent_coef,
+        batch_size=batch_size,
+        clip_range=clip_range,
+        seed=seed_value,
+        verbose=1
+    )
+
+   
+    eval_seed = seed_value + 10_000
+    eval_env = DummyVecEnv([make_env(seed=eval_seed)])
+    try:
+        eval_env.seed(eval_seed)
+    except Exception:
+        pass
+
+    eval_callback = EvalCallback(
+        eval_env,
+        eval_freq=10000,
+        n_eval_episodes=5,
+        verbose=1
+    )
+
+    
+    model.learn(
+        total_timesteps=4_000_000,
+        callback=[ReacherLoggingCallback(), eval_callback]
+    )
+    model.save("fixed_arm_directsweep.zip")
     wandb.finish()
+    venv.close()
 
-# Function to create environment (no radius change here, will use the manual reset_model changes)
-def make_env():
-    env = ReacherV3Env("reacher_v3.xml")  # r=0.04 will be set manually in reset_model()
-    env = Monitor(env, filename="monitor.csv")  # Wrap with Monitor for logging
-    return env
 
-# Create the vectorized environment (using the default radius in reset_model)
-def create_venv():
-    return DummyVecEnv([lambda: make_env()])
-
-# Start the sweep using WandB agent
-wandb.agent(sweep_id, function=train_sweep_model)
+if __name__ == "__main__":
+    with open("sweep_config.yaml") as f:
+        sweep_config = yaml.safe_load(f)
+    sweep_id = wandb.sweep(sweep=sweep_config, project="fixedarmdirectsweepwith5seeds_penalty_on")
+    wandb.agent(sweep_id, function=train)

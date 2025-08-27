@@ -1,14 +1,16 @@
-method: grid  # Grid search for hyperparameter tuning
-name: ppo_sweep_0.05
+method: grid
+name: 4M_bothrndm_onlyvarianceis5seeds
 metric:
-  name: success_rate
+  name: improvement_score   # <-- optimize improvement, not final SR
   goal: maximize
 parameters:
   learning_rate:
-    values: [1e-4,5e-5]
+    values: [3e-4]
   ent_coef:
-    values: [0.01,0.03]
+    values: [0.02]
   batch_size:
-    values: [64,128]
-
-  #include different variables...
+    values: [256]
+  clip_range:
+    values: [0.03]
+  seed:
+    values: [0, 7, 11, 31, 42]
