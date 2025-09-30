@@ -1,7 +1,7 @@
 method: grid
-name: 4M_bothrndm_onlyvarianceis5seeds
+name: energytracking_withpenalty_0.05_4M_withnewcharts
 metric:
-  name: improvement_score   # <-- optimize improvement, not final SR
+  name: success_rate   
   goal: maximize
 parameters:
   learning_rate:
